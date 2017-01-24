@@ -1979,6 +1979,13 @@ void reactor::register_collectd_metrics() {
                             [this] () -> int64_t { return std::chrono::duration_cast<std::chrono::nanoseconds>(total_busy_time()).count(); })
             ));
     _collectd_regs.push_back(
+            scollectd::add_polled_metric(scollectd::type_instance_id("reactor"
+                    , scollectd::per_cpu_plugin_instance
+                    , "derive", "polls")
+                    , scollectd::make_typed(scollectd::data_type::DERIVE,
+                            [this] () -> int64_t { return _polls ); })
+            ));
+    _collectd_regs.push_back(
             // total_operations value:DERIVE:0:U
             scollectd::add_polled_metric(scollectd::type_instance_id("reactor"
                     , scollectd::per_cpu_plugin_instance
@@ -2588,6 +2595,8 @@ int reactor::run() {
             }
             break;
         }
+
+        ++_polls;
 
         if (check_for_work()) {
             if (idle) {
