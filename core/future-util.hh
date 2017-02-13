@@ -79,6 +79,7 @@ struct parallel_for_each_state {
 ///         complete.  If one or more return an exception, the return value
 ///         contains one of the exceptions.
 template <typename Iterator, typename Func>
+GCC6_CONCEPT( requires requires (Func f, Iterator i) { { f(*i++) } -> future<>; } )
 inline
 future<>
 parallel_for_each(Iterator begin, Iterator end, Func&& func) {
@@ -130,6 +131,7 @@ parallel_for_each(Iterator begin, Iterator end, Func&& func) {
 ///         \c func returned an exceptional future, then the return
 ///         value will contain one of those exceptions.
 template <typename Range, typename Func>
+GCC6_CONCEPT( requires requires (Func f, Range r) { { f(*r.begin()) } -> future<>; } )
 inline
 future<>
 parallel_for_each(Range&& range, Func&& func) {
@@ -187,6 +189,7 @@ using stop_iteration = bool_class<stop_iteration_tag>;
 /// \return a ready future if we stopped successfully, or a failed future if
 ///         a call to to \c action failed.
 template<typename AsyncAction>
+GCC6_CONCEPT( requires seastar::ApplyReturns<AsyncAction, stop_iteration> || seastar::ApplyReturns<AsyncAction, future<stop_iteration>> )
 static inline
 future<> repeat(AsyncAction&& action) {
     using futurator = futurize<std::result_of_t<AsyncAction()>>;
@@ -258,6 +261,11 @@ using repeat_until_value_return_type
 /// \return a ready future if we stopped successfully, or a failed future if
 ///         a call to to \c action failed.  The \c optional's value is returned.
 template<typename AsyncAction>
+GCC6_CONCEPT( requires requires (AsyncAction aa) {
+    requires is_future<decltype(aa())>::value;
+    bool(aa().get0());
+    aa().get0().value();
+} )
 repeat_until_value_return_type<AsyncAction>
 repeat_until_value(AsyncAction&& action) {
     using type_helper = repeat_until_value_type_helper<std::result_of_t<AsyncAction()>>;
@@ -311,6 +319,7 @@ repeat_until_value(AsyncAction&& action) {
 /// \return a ready future if we stopped successfully, or a failed future if
 ///         a call to to \c action failed.
 template<typename AsyncAction, typename StopCondition>
+GCC6_CONCEPT( requires seastar::ApplyReturns<StopCondition, bool> && seastar::ApplyReturns<AsyncAction, future<>> )
 static inline
 future<> do_until(StopCondition&& stop_cond, AsyncAction&& action) {
     promise<> p;
@@ -328,6 +337,7 @@ future<> do_until(StopCondition&& stop_cond, AsyncAction&& action) {
 ///        that becomes ready when you wish it to be called again.
 /// \return a future<> that will resolve to the first failure of \c action
 template<typename AsyncAction>
+GCC6_CONCEPT( requires seastar::ApplyReturns<AsyncAction, future<>> )
 static inline
 future<> keep_doing(AsyncAction&& action) {
     return repeat([action = std::forward<AsyncAction>(action)] () mutable {
@@ -350,6 +360,7 @@ future<> keep_doing(AsyncAction&& action) {
 /// \return a ready future on success, or the first failed future if
 ///         \c action failed.
 template<typename Iterator, typename AsyncAction>
+GCC6_CONCEPT( requires requires (Iterator i, AsyncAction aa) { { aa(*i) } -> future<> } )
 static inline
 future<> do_for_each(Iterator begin, Iterator end, AsyncAction&& action) {
     if (begin == end) {
@@ -384,6 +395,7 @@ future<> do_for_each(Iterator begin, Iterator end, AsyncAction&& action) {
 /// \return a ready future on success, or the first failed future if
 ///         \c action failed.
 template<typename Container, typename AsyncAction>
+GCC6_CONCEPT( requires requires (Container c, AsyncAction aa) { { aa(*c.begin()) } -> future<> } )
 static inline
 future<> do_for_each(Container& c, AsyncAction&& action) {
     return do_for_each(std::begin(c), std::end(c), std::forward<AsyncAction>(action));
@@ -422,6 +434,39 @@ class when_all_state : public enable_lw_shared_from_this<when_all_state<Futures.
 };
 /// \endcond
 
+namespace seastar {
+
+GCC6_CONCEPT(
+
+/// \cond internal
+namespace impl {
+
+
+// Want: folds
+
+template <typename T>
+struct is_tuple_of_futures : std::false_type {
+};
+
+template <>
+struct is_tuple_of_futures<std::tuple<>> : std::true_type {
+};
+
+template <typename... T, typename... Rest>
+struct is_tuple_of_futures<std::tuple<future<T...>, Rest...>> : is_tuple_of_futures<std::tuple<Rest...>> {
+};
+
+}
+/// \endcond
+
+template <typename... Futs>
+concept bool AllAreFutures = impl::is_tuple_of_futures<std::tuple<Futs...>>::value;
+
+)
+
+}
+
+
 /// Wait for many futures to complete, capturing possible errors (variadic version).
 ///
 /// Given a variable number of futures as input, wait for all of them
@@ -432,6 +477,7 @@ class when_all_state : public enable_lw_shared_from_this<when_all_state<Futures.
 /// \return an \c std::tuple<> of all the futures in the input; when
 ///         ready, all contained futures will be ready as well.
 template <typename... Futs>
+GCC6_CONCEPT( requires seastar::AllAreFutures<Futs...> )
 inline
 future<std::tuple<Futs...>>
 when_all(Futs&&... futs) {
@@ -488,6 +534,7 @@ complete_when_all(std::vector<Future>&& futures, typename std::vector<Future>::i
 /// \return an \c std::vector<> of all the futures in the input; when
 ///         ready, all contained futures will be ready as well.
 template <typename FutureIterator>
+GCC6_CONCEPT( requires requires (FutureIterator i) { { *i++ }; requires is_future<std::remove_reference_t<decltype(*i)>>::value; } )
 inline
 future<std::vector<typename std::iterator_traits<FutureIterator>::value_type>>
 when_all(FutureIterator begin, FutureIterator end) {
