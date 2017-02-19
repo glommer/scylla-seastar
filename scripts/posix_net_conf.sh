@@ -256,15 +256,7 @@ parse_args()
 #
 get_def_mq_mode()
 {
-    local iface=$1
-    local num_irqs=`get_irqs $iface | wc -l`
-    local num_cores=`hwloc-calc --number-of core machine:0`
-
-    if [ "$num_irqs" -ge "$((num_cores / 2))" ] || [ "$num_irqs" -ge 8 ]; then
-        echo "mq"
-    else
-        echo "sq"
-    fi
+    echo "sq"
 }
 
 #
@@ -324,7 +316,7 @@ gen_cpumask_one_hw_iface()
 
     # bind all NIC IRQs to CPU0
     if [[ "$mq_mode" == "sq" ]]; then
-        hwloc-distrib --restrict $(hwloc-calc all ~core:0) 1 
+        hwloc-distrib --restrict $(hwloc-calc all ~PU:0) 1 
     else # "$mq_mode == "mq"
         hwloc-calc all
     fi
