@@ -40,23 +40,28 @@
 using namespace std::chrono_literals;
 
 namespace httpd {
-http_stats::http_stats(http_server& server)
+http_stats::http_stats(http_server& server, const sstring& name)
     : _regs{
         scollectd::add_polled_metric(
-            scollectd::type_instance_id("httpd", scollectd::per_cpu_plugin_instance,
+            scollectd::type_instance_id(name, scollectd::per_cpu_plugin_instance,
                     "connections", "http-connections"),
             scollectd::make_typed(scollectd::data_type::DERIVE,
                     [&server] { return server.total_connections(); })),
         scollectd::add_polled_metric(
-            scollectd::type_instance_id("httpd", scollectd::per_cpu_plugin_instance,
+            scollectd::type_instance_id(name, scollectd::per_cpu_plugin_instance,
                     "current_connections", "current"),
             scollectd::make_typed(scollectd::data_type::GAUGE,
                     [&server] { return server.current_connections(); })),
         scollectd::add_polled_metric(
-            scollectd::type_instance_id("httpd", scollectd::per_cpu_plugin_instance,
+            scollectd::type_instance_id(name, scollectd::per_cpu_plugin_instance,
                     "http_requests", "served"),
             scollectd::make_typed(scollectd::data_type::DERIVE,
                     [&server] { return server.requests_served(); })),
     } {
+}
+
+sstring http_server_control::generate_server_name() {
+    static thread_local uint16_t idgen;
+    return seastar::format("http-{}", idgen++);
 }
 }
