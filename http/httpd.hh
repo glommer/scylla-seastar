@@ -211,6 +211,8 @@ public:
     }
 };
 
+class http_server_tester;
+
 class http_server {
     std::vector<server_socket> _listeners;
     http_stats _stats;
@@ -309,6 +311,14 @@ public:
 private:
     boost::intrusive::list<connection> _connections;
     friend class httpd::connection;
+    friend class http_server_tester;
+};
+
+class http_server_tester {
+public:
+    static std::vector<server_socket>& listeners(http_server& server) {
+        return server._listeners;
+    }
 };
 
 /*
