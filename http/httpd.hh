@@ -97,6 +97,9 @@ public:
     future<> read_one();
     future<> respond();
     future<> do_response_loop();
+
+    void set_headers(reply& resp);
+
     future<> start_response();
     future<> write_reply_headers(
             std::unordered_map<sstring, sstring>::iterator hi) {
