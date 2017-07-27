@@ -284,6 +284,8 @@ add_tristate(arg_parser, name = 'hwloc', dest = 'hwloc', help = 'hwloc support')
 add_tristate(arg_parser, name = 'xen', dest = 'xen', help = 'Xen support')
 arg_parser.add_argument('--enable-gcc6-concepts', dest='gcc6_concepts', action='store_true', default=False,
                         help='enable experimental support for C++ Concepts as implemented in GCC 6')
+add_tristate(arg_parser, name = 'exception-scalability-workaround', dest='exception_workaround',
+        help='disabling override of dl_iterate_phdr symbol to workaround C++ exception scalability issues')
 args = arg_parser.parse_args()
 
 libnet = [
@@ -321,6 +323,7 @@ core = [
     'net/stack.cc',
     'rpc/rpc.cc',
     'rpc/lz4_compressor.cc',
+    'core/exception_hacks.cc',
     ]
 
 protobuf = [
@@ -401,6 +404,11 @@ if xen_used and args.dpdk_target:
 if args.gcc6_concepts:
     defines.append('HAVE_GCC6_CONCEPTS')
     args.user_cflags += ' -fconcepts'
+
+if not apply_tristate(args.exception_workaround, test = lambda: not args.staticcxx and not args.static,
+        note = "Note: disabling exception scalability workaround due to static linkage of libgcc and libstdc++",
+        missing = "Error: cannot enable exception scalability workaround with static linkage of libgcc and libstdc++"):
+    defines.append('NO_EXCEPTION_HACK')
 
 if args.staticcxx:
     libs = libs.replace('-lstdc++', '')

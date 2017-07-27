@@ -90,6 +90,7 @@
 
 #include <xmmintrin.h>
 #include "util/defer.hh"
+#include "exception_hacks.hh"
 
 using namespace std::chrono_literals;
 
@@ -3372,6 +3373,9 @@ smp::get_options_description()
 #else
         ("max-io-requests", bpo::value<unsigned>(), "Maximum amount of concurrent requests to be sent to the disk. Defaults to 128 times the number of processors")
 #endif
+#ifndef NO_EXCEPTION_HACK
+        ("enable-glibc-exception-scaling-workaround", bpo::value<bool>()->default_value(true), "enable workaround for glibc/gcc c++ exception scalablity problem")
+#endif
         ;
     return opts;
 }
@@ -3507,6 +3511,12 @@ static void sigabrt_action() noexcept {
 
 void smp::configure(boost::program_options::variables_map configuration)
 {
+#ifndef NO_EXCEPTION_HACK
+    if (configuration["enable-glibc-exception-scaling-workaround"].as<bool>()) {
+        init_phdr_cache();
+    }
+#endif
+
     // Mask most, to prevent threads (esp. dpdk helper threads)
     // from servicing a signal.  Individual reactors will unmask signals
     // as they become prepared to handle them.
