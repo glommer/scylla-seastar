@@ -29,6 +29,10 @@ set_one_mask()
 {
     local cpuset_conf_file=$1
     local mask=`echo $2 | sed -e 's/0x//g'`
+    while echo "$mask" | grep -q ",,"
+    do
+        mask=$(echo "$mask" | sed -e 's/,,/,0,/g')
+    done
     echo "Setting mask $mask in $cpuset_conf_file"
     echo $mask > $cpuset_conf_file
 }
