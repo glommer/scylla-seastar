@@ -496,7 +496,7 @@ auto recv_helper(signature<Ret (InArgs...)> sig, Func&& func, WantClientInfo wci
         if (memory_consumed > client->max_request_size()) {
             auto err = sprint("request size %d large than memory limit %d", memory_consumed, client->max_request_size());
             client->get_protocol().log(client->peer_address(), err);
-	    seastar::with_gate(client->get_server().reply_gate(), [client, timeout, msg_id, err = std::move(err)] {
+            seastar::with_gate(client->get_server().reply_gate(), [client, timeout, msg_id, err = std::move(err)] {
                 return reply<Serializer, MsgType>(wait_style(), futurize<Ret>::make_exception_future(std::runtime_error(err.c_str())), msg_id, client, timeout);
             });
             return make_ready_future();
