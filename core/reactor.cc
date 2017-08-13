@@ -2134,7 +2134,7 @@ void reactor::register_collectd_metrics() {
             scollectd::add_polled_metric(scollectd::type_instance_id("reactor"
                     , scollectd::per_cpu_plugin_instance
                     , "total_operations", "tasks-processed")
-                    , scollectd::make_typed(scollectd::data_type::DERIVE, _tasks_processed)
+                    , scollectd::make_typed(scollectd::data_type::DERIVE, [this] { return _tasks_processed.load(std::memory_order_relaxed); })
             ));
     _collectd_regs.push_back(
             // queue_length     value:GAUGE:0:U
