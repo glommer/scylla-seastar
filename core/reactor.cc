@@ -2164,7 +2164,7 @@ void reactor::register_collectd_metrics() {
                     , scollectd::per_cpu_plugin_instance
                     , "derive", "polls")
                     , scollectd::make_typed(scollectd::data_type::DERIVE,
-                            [this] () -> int64_t { return _polls ); })
+                            [this] () -> int64_t { return _polls; })
             ));
     _collectd_regs.push_back(
             // total_operations value:DERIVE:0:U
