@@ -17,6 +17,7 @@ struct mapping {
     const char* extension;
     const char* mime_type;
 } mappings[] = {
+        { "json", "application/json"},
         { "gif", "image/gif" },
         { "htm", "text/html" },
         { "css", "text/css" },
