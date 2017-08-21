@@ -1670,6 +1670,19 @@ memory_layout get_memory_layout() {
     throw std::runtime_error("get_memory_layout() not supported");
 }
 
+void set_large_allocation_warning_threshold(size_t) {
+    // Ignore, not supported for default allocator.
+}
+
+size_t get_large_allocation_warning_threshold() {
+    // Ignore, not supported for default allocator.
+    return std::numeric_limits<size_t>::max();
+}
+
+void disable_large_allocation_warning() {
+    // Ignore, not supported for default allocator.
+}
+
 }
 
 void* operator new(size_t size, with_alignment wa) {
