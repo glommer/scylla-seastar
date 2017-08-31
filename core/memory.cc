@@ -52,8 +52,11 @@
 
 #include "memory.hh"
 #include "reactor.hh"
+#include "../util/log.hh"
 
 namespace memory {
+
+seastar::logger seastar_memory_logger("seastar_memory");
 
 static thread_local int abort_on_alloc_failure_suppressed = 0;
 
