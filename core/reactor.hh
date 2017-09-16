@@ -737,6 +737,7 @@ private:
     std::atomic<bool> _sleeping alignas(64);
     pthread_t _thread_id alignas(64) = pthread_self();
     bool _strict_o_direct = true;
+    bool _bypass_fsync = false;
     bool& _local_need_preempt{g_need_preempt}; // for access from the _task_quota_timer_thread
     std::thread _task_quota_timer_thread;
     std::atomic<bool> _dying{false};
@@ -983,6 +984,9 @@ public:
     /// performance and an increase in memory consumption.
     void set_strict_dma(bool value) {
         _strict_o_direct = value;
+    }
+    void set_bypass_fsync(bool value) {
+        _bypass_fsync = value;
     }
 };
 
