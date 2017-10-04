@@ -238,6 +238,7 @@ tests = [
     'tests/scollectd_test',
     'tests/perf/perf_fstream',
     'tests/json_formatter_test',
+    'tests/noncopyable_function_test',
     ]
 
 apps = [
@@ -474,6 +475,7 @@ deps = {
     'tests/scollectd_test': ['tests/scollectd_test.cc'] + core,
     'tests/perf/perf_fstream': ['tests/perf/perf_fstream.cc'] + core,
     'tests/json_formatter_test': ['tests/json_formatter_test.cc'] + core + http,
+    'tests/noncopyable_function_test': ['tests/noncopyable_function_test.cc'],
 }
 
 boost_tests = [
