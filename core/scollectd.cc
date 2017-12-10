@@ -69,7 +69,8 @@ registration::registration(type_instance_id&& id)
 }
 
 seastar::metrics::impl::metric_id to_metrics_id(const type_instance_id & id) {
-    return std::move(seastar::metrics::impl::metric_id(id.plugin(), id.plugin_instance(), id.type() + "_" + id.type_instance(), id.type()));
+    return std::move(seastar::metrics::impl::metric_id(id.plugin(), id.type() + "_" + id.type_instance(),
+            {{seastar::metrics::shard_label.name(), seastar::metrics::impl::shard()}, {seastar::metrics::type_label.name(), id.type()}}));
 }
 
 
@@ -145,6 +146,19 @@ struct cpwriter {
         _overflow |= av < sz;
         return *this;
     }
+
+    sstring get_type_instance(const seastar::metrics::impl::metric_id & id) {
+        if (id.labels().empty()) {
+            return id.name();
+        }
+        sstring res = id.name();
+        for (auto i : id.labels()) {
+            if (i.first != seastar::metrics::shard_label.name() && i.first != seastar::metrics::type_label.name()) {
+                res += "-" + i.second;
+            }
+        }
+        return res;
+    }
     explicit operator bool() const {
         return !_overflow;
     }
@@ -177,9 +191,13 @@ struct cpwriter {
     }
     void write_value(const seastar::metrics::impl::metric_value& v) {
         switch (v.type()) {
-            case data_type::GAUGE:
-                write_le(v.ui());
+            case data_type::GAUGE: {
+                double tmpd = v.d();
+                uint64_t tmpi;
+                std::copy_n(reinterpret_cast<const char*>(&tmpd), 8, reinterpret_cast<char*>(&tmpi));
+                write_le(tmpi);
                 break;
+            }
             case data_type::COUNTER:
             case data_type::DERIVE:
             case data_type::ABSOLUTE:
@@ -258,7 +276,7 @@ struct cpwriter {
                         to_sstring(engine().cpu_id()) : id.instance_id());
         put_cached(part_type::Type, id.inherit_type());
         // Optional
-        put_cached(part_type::TypeInst, id.name());
+        put_cached(part_type::TypeInst, get_type_instance(id));
         return *this;
     }
     cpwriter & put(const sstring & host,
@@ -382,37 +400,65 @@ void impl::arm() {
 }
 
 void impl::run() {
-    typedef seastar::metrics::impl::values_copy::iterator iterator;
-    typedef std::tuple<iterator, cpwriter> context;
+    typedef size_t metric_family_id;
+    typedef seastar::metrics::impl::value_vector::iterator value_iterator;
+    typedef seastar::metrics::impl::metric_metadata_vector::iterator metadata_iterator;
+    typedef std::tuple<metric_family_id, metadata_iterator, value_iterator, cpwriter> context;
 
     auto ctxt = make_lw_shared<context>();
-    auto vals =  make_lw_shared<seastar::metrics::impl::values_copy>(seastar::metrics::impl::get_values());
+    foreign_ptr<shared_ptr<seastar::metrics::impl::values_copy>> vals =  seastar::metrics::impl::get_values();
 
     // note we're doing this unsynced since we assume
     // all registrations to this instance will be done on the
     // same cpu, and without interuptions (no wait-states)
-    std::get<iterator>(*ctxt) = vals->begin();
 
-    auto stop_when = [this, ctxt, vals]() {
-        auto done = std::get<iterator>(*ctxt) == vals->end();
+    auto& values = vals->values;
+    auto metadata = vals->metadata;
+    std::get<metric_family_id>(*ctxt) = 0;
+    if (values.size() > 0) {
+        std::get<value_iterator>(*ctxt) = values[0].begin();
+        std::get<metadata_iterator>(*ctxt) = metadata->at(0).metrics.begin();
+    }
+
+    auto stop_when = [ctxt, metadata]() {
+        auto done = std::get<metric_family_id>(*ctxt) == metadata->size();
         return done;
     };
     // append as many values as we can fit into a packet (1024 bytes)
-    auto send_packet = [this, ctxt, vals]() {
+    auto send_packet = [this, ctxt, &values, metadata]() mutable {
         auto start = steady_clock_type::now();
-        auto & i = std::get<iterator>(*ctxt);
+        auto& mf = std::get<metric_family_id>(*ctxt);
+        auto & md_iterator = std::get<metadata_iterator>(*ctxt);
+        auto & i = std::get<value_iterator>(*ctxt);
         auto & out = std::get<cpwriter>(*ctxt);
 
         out.clear();
 
-        while (i != vals->end()) {
-            auto m = out.mark();
-            out.put(_host, _period, i->first, i->second);
-            if (!out) {
-                out.reset(m);
+        bool out_of_space = false;
+        while (!out_of_space && mf < values.size()) {
+            while (i != values[mf].end()) {
+                if (i->type() == seastar::metrics::impl::data_type::HISTOGRAM) {
+                    ++i;
+                    ++md_iterator;
+                    continue;
+                }
+                auto m = out.mark();
+                out.put(_host, _period, md_iterator->id, *i);
+                if (!out) {
+                    out.reset(m);
+                    out_of_space = true;
+                    break;
+                }
+                ++i;
+            }
+            if (out_of_space) {
                 break;
             }
-            ++i;
+            ++mf;
+            if (mf < values.size()) {
+                i = values[mf].begin();
+                md_iterator = metadata->at(mf).metrics.begin();
+            }
         }
         if (out.empty()) {
             return make_ready_future();
@@ -435,20 +481,22 @@ void impl::run() {
                     }
                 });
     };
-    do_until(stop_when, send_packet).finally([this]() {
+    do_until(stop_when, send_packet).finally([this, vals = std::move(vals)]() mutable {
         arm();
     });
 }
 
 std::vector<type_instance_id> impl::get_instance_ids() const {
     std::vector<type_instance_id> res;
-    for (auto i: values()) {
+    for (auto&& v: values()) {
         // Need to check for empty value_list, since unreg is two-stage.
         // Not an issue for most uses, but unit testing etc that would like
         // fully deterministic operation here would like us to only return
         // actually active ids
-        if (i.second) {
-            res.emplace_back(i.first);
+        for (auto i : v.second) {
+            if (i.second) {
+                res.emplace_back(i.second->get_id());
+            }
         }
     }
     return res;
@@ -481,7 +529,9 @@ void configure(const boost::program_options::variables_map & opts) {
     auto addr = ipv4_addr(opts["collectd-address"].as<std::string>());
     auto period = std::chrono::milliseconds(opts["collectd-poll-period"].as<unsigned>());
 
-    auto host = opts["collectd-hostname"].as<std::string>();
+    auto host = (opts["collectd-hostname"].as<std::string>() == "")
+            ? seastar::metrics::impl::get_local_impl()->get_config().hostname
+            : sstring(opts["collectd-hostname"].as<std::string>());
 
     // Now create send loops on each cpu
     for (unsigned c = 0; c < smp::count; c++) {
@@ -494,9 +544,6 @@ void configure(const boost::program_options::variables_map & opts) {
 boost::program_options::options_description get_options_description() {
     namespace bpo = boost::program_options;
     bpo::options_description opts("COLLECTD options");
-    char hostname[PATH_MAX];
-    gethostname(hostname, sizeof(hostname));
-    hostname[PATH_MAX-1] = '\0';
     opts.add_options()("collectd", bpo::value<bool>()->default_value(false),
             "enable collectd daemon")("collectd-address",
             bpo::value<std::string>()->default_value("239.192.74.66:25826"),
@@ -504,27 +551,21 @@ boost::program_options::options_description get_options_description() {
             bpo::value<unsigned>()->default_value(1000),
             "poll period - frequency of sending counter metrics (default: 1000ms, 0 disables)")(
             "collectd-hostname",
-            bpo::value<std::string>()->default_value(hostname),
-            "collectd host name");
+            bpo::value<std::string>()->default_value(""),
+            "Deprecated option, use metrics-hostname instead");
     return opts;
+}
+
+static seastar::metrics::impl::register_ref get_register(const scollectd::type_instance_id& i) {
+    seastar::metrics::impl::metric_id id = to_metrics_id(i);
+    return seastar::metrics::impl::get_value_map().at(id.full_name()).at(id.labels());
 }
 
 std::vector<collectd_value> get_collectd_value(
         const scollectd::type_instance_id& id) {
     std::vector<collectd_value> vals;
-    const seastar::metrics::impl::registered_metric& val = *seastar::metrics::impl::get_value_map().at(to_metrics_id(id));
+    const seastar::metrics::impl::registered_metric& val = *get_register(id);
     vals.push_back(val());
-    return vals;
-}
-
-std::vector<data_type> get_collectd_types(
-        const scollectd::type_instance_id& id) {
-    auto res = seastar::metrics::impl::get_value_map().at(to_metrics_id(id));
-    if (res == nullptr) {
-        return std::vector<data_type>();
-    }
-    std::vector<data_type> vals;
-    vals.push_back(res->get_type());
     return vals;
 }
 
@@ -532,17 +573,12 @@ std::vector<scollectd::type_instance_id> get_collectd_ids() {
     return get_impl().get_instance_ids();
 }
 
-sstring get_collectd_description_str(const scollectd::type_instance_id& id) {
-    auto v = seastar::metrics::impl::get_value_map().at(to_metrics_id(id));
-    return v != nullptr ? v->get_description().str() : sstring();
-}
-
 bool is_enabled(const scollectd::type_instance_id& id) {
-    return seastar::metrics::impl::get_value_map().at(to_metrics_id(id))->is_enabled();
+    return get_register(id)->is_enabled();
 }
 
 void enable(const scollectd::type_instance_id& id, bool enable) {
-    seastar::metrics::impl::get_value_map().at(to_metrics_id(id))->set_enabled(enable);
+    get_register(id)->set_enabled(enable);
 }
 
 type_instance_id plugin_instance_metrics::add_impl(const typed_value& v) {

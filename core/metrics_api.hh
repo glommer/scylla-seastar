@@ -24,6 +24,7 @@
 #include "metrics.hh"
 #include <unordered_map>
 #include "sharded.hh"
+#include <boost/functional/hash.hpp>
 /*!
  * \file metrics_api.hh
  * \brief header file for metric API layer (like promehteus or collectd)
@@ -34,6 +35,33 @@
 namespace seastar {
 namespace metrics {
 namespace impl {
+
+using labels_type = std::map<sstring, sstring>;
+}
+}
+}
+
+namespace std {
+
+template<>
+struct hash<seastar::metrics::impl::labels_type> {
+    using argument_type = seastar::metrics::impl::labels_type;
+    using result_type = ::std::size_t;
+    result_type operator()(argument_type const& s) const {
+        result_type h = 0;
+        for (auto&& i : s) {
+            boost::hash_combine(h, std::hash<sstring>{}(i.second));
+        }
+        return h;
+    }
+};
+
+}
+
+namespace seastar {
+namespace metrics {
+namespace impl {
+
 /**
  * Metrics are collected in groups that belongs to some logical entity.
  * For example, different measurements of the cpu, will belong to group "cpu".
@@ -50,10 +78,10 @@ namespace impl {
 class metric_id {
 public:
     metric_id() = default;
-    metric_id(group_name_type group, instance_id_type instance, metric_name_type name,
-                    metrics::metric_type_def iht = std::string())
-                    : _group(std::move(group)), _instance_id(std::move(instance)), _name(
-                                    std::move(name)), _inherit_type(std::move(iht)) {
+    metric_id(group_name_type group, metric_name_type name,
+                    labels_type labels = {})
+                    : _group(std::move(group)), _name(
+                                    std::move(name)), _labels(labels) {
     }
     metric_id(metric_id &&) = default;
     metric_id(const metric_id &) = default;
@@ -68,21 +96,29 @@ public:
         _group = name;
     }
     const instance_id_type & instance_id() const {
-        return _instance_id;
+        return _labels.at(shard_label.name());
     }
     const metric_name_type & name() const {
         return _name;
     }
     const metrics::metric_type_def & inherit_type() const {
-        return _inherit_type;
+        return _labels.at(type_label.name());
     }
+    const labels_type& labels() const {
+        return _labels;
+    }
+    sstring full_name() const;
+
     bool operator<(const metric_id&) const;
     bool operator==(const metric_id&) const;
 private:
+    auto as_tuple() const {
+        return std::tie(group_name(), instance_id(), name(),
+                    inherit_type(), labels());
+    }
     group_name_type _group;
-    instance_id_type _instance_id;
     metric_name_type _name;
-    metric_type_def _inherit_type;
+    labels_type _labels;
 };
 }
 }
@@ -109,6 +145,28 @@ namespace seastar {
 namespace metrics {
 namespace impl {
 
+/*!
+ * \brief holds metadata information of a metric family
+ *
+ * Holds the information that is shared between all metrics
+ * that belongs to the same metric_family
+ */
+struct metric_family_info {
+    data_type type;
+    description d;
+    sstring name;
+};
+
+
+/*!
+ * \brief holds metric metadata
+ */
+struct metric_info {
+    metric_id id;
+    bool enabled;
+};
+
+
 using metrics_registration = std::vector<metric_id>;
 
 class metric_groups_impl : public metric_groups_def {
@@ -126,39 +184,146 @@ public:
 class impl;
 
 class registered_metric {
-    data_type _type;
-    description _d;
-    bool _enabled;
+    metric_info _info;
     metric_function _f;
     shared_ptr<impl> _impl;
 public:
-    registered_metric(data_type type, metric_function f, description d = description(), bool enabled=true);
+    registered_metric(metric_id id, metric_function f, bool enabled=true);
     virtual ~registered_metric() {}
     virtual metric_value operator()() const {
         return _f();
     }
-    data_type get_type() const {
-        return _type;
-    }
 
     bool is_enabled() const {
-        return _enabled;
+        return _info.enabled;
     }
 
     void set_enabled(bool b) {
-        _enabled = b;
+        _info.enabled = b;
     }
 
-    const description& get_description() const {
-        return _d;
+    const metric_id& get_id() const {
+        return _info.id;
+    }
+
+    const metric_info& info() const {
+        return _info;
+    }
+    metric_function& get_function() {
+        return _f;
     }
 };
 
-typedef std::unordered_map<metric_id, shared_ptr<registered_metric> > value_map;
-typedef std::unordered_map<metric_id, metric_value> values_copy;
+using register_ref = shared_ptr<registered_metric>;
+using metric_instances = std::map<labels_type, register_ref>;
+
+class metric_family {
+    metric_instances _instances;
+    metric_family_info _info;
+public:
+    using iterator = metric_instances::iterator;
+    using const_iterator = metric_instances::const_iterator;
+
+    metric_family() = default;
+    metric_family(const metric_family&) = default;
+    metric_family(const metric_instances& instances) : _instances(instances) {
+    }
+    metric_family(const metric_instances& instances, const metric_family_info& info) : _instances(instances), _info(info) {
+    }
+    metric_family(metric_instances&& instances, metric_family_info&& info) : _instances(std::move(instances)), _info(std::move(info)) {
+    }
+    metric_family(metric_instances&& instances) : _instances(std::move(instances)) {
+    }
+
+    register_ref& operator[](const labels_type& l) {
+        return _instances[l];
+    }
+
+    const register_ref& at(const labels_type& l) const {
+        return _instances.at(l);
+    }
+
+    metric_family_info& info() {
+        return _info;
+    }
+
+    const metric_family_info& info() const {
+        return _info;
+    }
+
+    iterator find(const labels_type& l) {
+        return _instances.find(l);
+    }
+
+    const_iterator find(const labels_type& l) const {
+        return _instances.find(l);
+    }
+
+    iterator begin() {
+        return _instances.begin();
+    }
+
+    const_iterator begin() const {
+        return _instances.cbegin();
+    }
+
+    iterator end() {
+        return _instances.end();
+    }
+
+    bool empty() const {
+        return _instances.empty();
+    }
+
+    iterator erase(const_iterator position) {
+        return _instances.erase(position);
+    }
+
+    const_iterator end() const {
+        return _instances.cend();
+    }
+
+    uint32_t size() const {
+        return _instances.size();
+    }
+
+};
+
+using value_map = std::map<sstring, metric_family>;
+
+using metric_metadata_vector = std::vector<metric_info>;
+
+/*!
+ * \brief holds a metric family metadata
+ *
+ * The meta data of a metric family compose of the
+ * metadata of the family, and a vector of the metadata for
+ * each of the metric.
+ */
+struct metric_family_metadata {
+    metric_family_info mf;
+    metric_metadata_vector metrics;
+};
+
+using value_vector = std::vector<metric_value>;
+using metric_metadata = std::vector<metric_family_metadata>;
+using metric_values = std::vector<value_vector>;
+
+struct values_copy {
+    shared_ptr<metric_metadata> metadata;
+    metric_values values;
+};
+
+struct config {
+    sstring hostname;
+};
 
 class impl {
     value_map _value_map;
+    config _config;
+    bool _dirty = true;
+    shared_ptr<metric_metadata> _metadata;
+    std::vector<std::vector<metric_function>> _current_metrics;
 public:
     value_map& get_value_map() {
         return _value_map;
@@ -168,16 +333,33 @@ public:
         return _value_map;
     }
 
-    void add_registration(const metric_id& id, shared_ptr<registered_metric> rm);
-
+    void add_registration(const metric_id& id, data_type type, metric_function f, const description& d, bool enabled);
+    void remove_registration(const metric_id& id);
     future<> stop() {
         return make_ready_future<>();
+    }
+    const config& get_config() const {
+        return _config;
+    }
+    void set_config(const config& c) {
+        _config = c;
+    }
+
+    shared_ptr<metric_metadata> metadata();
+
+    std::vector<std::vector<metric_function>>& functions();
+
+    void update_metrics_if_needed();
+
+    void dirty() {
+        _dirty = true;
     }
 };
 
 const value_map& get_value_map();
+using values_reference = shared_ptr<values_copy>;
 
-values_copy get_values();
+foreign_ptr<values_reference> get_values();
 
 shared_ptr<impl> get_local_impl();
 
@@ -192,5 +374,16 @@ void unregister_metric(const metric_id & id);
 std::unique_ptr<metric_groups_def> create_metric_groups();
 
 }
+/*!
+ * \brief set the metrics configuration
+ */
+future<> configure(const boost::program_options::variables_map & opts);
+
+/*!
+ * \brief get the metrics configuration desciprtion
+ */
+
+boost::program_options::options_description get_options_description();
+
 }
 }

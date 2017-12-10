@@ -30,8 +30,16 @@ namespace prometheus {
  */
 struct config {
     sstring metric_help; //!< Default help message for the returned metrics
+    sstring hostname; //!< name of the local host, if left empty, gethostname will be used
     sstring prefix = "seastar"; //!< a prefix that will be added to metric names
 };
 
-future<> start(httpd::http_server_control& http_server, const config& ctx);
+future<> start(httpd::http_server_control& http_server, config ctx);
+
+/// \defgroup add_prometheus_routes adds a /metrics endpoint that returns prometheus metrics
+///    both in txt format and in protobuf according to the prometheus spec
+/// @{
+future<> add_prometheus_routes(distributed<http_server>& server, config ctx);
+future<> add_prometheus_routes(http_server& server, config ctx);
+/// @}
 }

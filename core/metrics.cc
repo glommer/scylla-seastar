@@ -21,6 +21,10 @@
 
 #include "metrics.hh"
 #include "metrics_api.hh"
+#include <boost/range/algorithm.hpp>
+#include <boost/algorithm/string.hpp>
+#include <boost/algorithm/string/replace.hpp>
+#include <boost/range/algorithm_ext/erase.hpp>
 
 namespace seastar {
 namespace metrics {
@@ -39,36 +43,104 @@ metric_definition::metric_definition(impl::metric_definition_impl const& m) :
     _impl(std::make_unique<impl::metric_definition_impl>(m)) {
 }
 
+bool label_instance::operator<(const label_instance& id2) const {
+    auto& id1 = *this;
+    return std::tie(id1.key(), id1.value())
+                < std::tie(id2.key(), id2.value());
+}
+
+bool label_instance::operator==(const label_instance& id2) const {
+    auto& id1 = *this;
+    return std::tie(id1.key(), id1.value())
+                    == std::tie(id2.key(), id2.value());
+}
+
+
+static std::string get_hostname() {
+    char hostname[PATH_MAX];
+    gethostname(hostname, sizeof(hostname));
+    hostname[PATH_MAX-1] = '\0';
+    return hostname;
+}
+
+
+boost::program_options::options_description get_options_description() {
+    namespace bpo = boost::program_options;
+    bpo::options_description opts("Metrics options");
+    opts.add_options()(
+            "metrics-hostname",
+            bpo::value<std::string>()->default_value(get_hostname()),
+            "set the hostname used by the metrics, if not set, the local hostname will be used");
+    return opts;
+}
+
+future<> configure(const boost::program_options::variables_map & opts) {
+    impl::config c;
+    c.hostname = opts["metrics-hostname"].as<std::string>();
+    return smp::invoke_on_all([c] {
+        impl::get_local_impl()->set_config(c);
+    });
+}
+
+
+bool label_instance::operator!=(const label_instance& id2) const {
+    auto& id1 = *this;
+    return !(id1 == id2);
+}
+
+label shard_label("shard");
+label type_label("type");
 namespace impl {
 
-registered_metric::registered_metric(data_type type, metric_function f, description d, bool enabled) :
-        _type(type), _d(d), _enabled(enabled), _f(f), _impl(get_local_impl()) {
+registered_metric::registered_metric(metric_id id, metric_function f, bool enabled) :
+        _f(f), _impl(get_local_impl()) {
+    _info.enabled = enabled;
+    _info.id = id;
 }
 
 metric_value metric_value::operator+(const metric_value& c) {
     metric_value res(*this);
     switch (_type) {
-    case data_type::GAUGE:
-        res.u._d += c.u._d;
-        break;
-    case data_type::DERIVE:
-        res.u._i += c.u._i;
-        break;
+    case data_type::HISTOGRAM:
+        boost::get<histogram>(res.u) += boost::get<histogram>(c.u);
     default:
-        res.u._ui += c.u._ui;
+        boost::get<double>(res.u) += boost::get<double>(c.u);
         break;
     }
     return res;
 }
 
-std::unique_ptr<metric_groups_def> create_metric_groups() {
-    return  std::make_unique<metric_groups_impl>();
+metric_definition_impl::metric_definition_impl(
+        metric_name_type name,
+        metric_type type,
+        metric_function f,
+        description d,
+        std::vector<label_instance> _labels)
+        : name(name), type(type), f(f)
+        , d(d), enabled(true) {
+    for (auto i: _labels) {
+        labels[i.key()] = i.value();
+    }
+    if (labels.find(shard_label.name()) == labels.end()) {
+        labels[shard_label.name()] = shard();
+    }
+    if (labels.find(type_label.name()) == labels.end()) {
+        labels[type_label.name()] = type.type_name;
+    }
 }
 
+metric_definition_impl& metric_definition_impl::operator ()(bool _enabled) {
+    enabled = _enabled;
+    return *this;
+}
 
-std::unique_ptr<metric_id> get_id(group_name_type group, instance_id_type instance, metric_name_type name,
-        metric_type_def iht) {
-    return std::make_unique<metric_id>(group, instance, name, iht);
+metric_definition_impl& metric_definition_impl::operator ()(const label_instance& label) {
+    labels[label.key()] = label.value();
+    return *this;
+}
+
+std::unique_ptr<metric_groups_def> create_metric_groups() {
+    return  std::make_unique<metric_groups_impl>();
 }
 
 metric_groups_impl::~metric_groups_impl() {
@@ -79,12 +151,9 @@ metric_groups_impl::~metric_groups_impl() {
 
 metric_groups_impl& metric_groups_impl::add_metric(group_name_type name, const metric_definition& md)  {
 
-    metric_id id(name, md._impl->id, md._impl->name, md._impl->type.type_name);
+    metric_id id(name, md._impl->name, md._impl->labels);
 
-    shared_ptr<registered_metric> rm =
-            ::make_shared<registered_metric>(md._impl->type.base_type, md._impl->f, md._impl->d, md._impl->enabled);
-
-    get_local_impl()->add_registration(id, rm);
+    get_local_impl()->add_registration(id, md._impl->type.base_type, md._impl->f, md._impl->d, md._impl->enabled);
 
     _registration.push_back(id);
     return *this;
@@ -106,51 +175,70 @@ metric_groups_impl& metric_groups_impl::add_group(group_name_type name, const st
 
 bool metric_id::operator<(
         const metric_id& id2) const {
-    auto& id1 = *this;
-    return std::tie(id1.group_name(), id1.instance_id(), id1.name(),
-            id1.inherit_type())
-            < std::tie(id2.group_name(), id2.instance_id(), id2.name(),
-                    id2.inherit_type());
+    return as_tuple() < id2.as_tuple();
+}
+
+static std::string safe_name(const sstring& name) {
+    auto rep = boost::replace_all_copy(boost::replace_all_copy(name, "-", "_"), " ", "_");
+    boost::remove_erase_if(rep, boost::is_any_of("+()"));
+    return rep;
+}
+
+sstring metric_id::full_name() const {
+    return safe_name(_group + "_" + _name);
 }
 
 bool metric_id::operator==(
         const metric_id & id2) const {
-    auto& id1 = *this;
-    return std::tie(id1.group_name(), id1.instance_id(), id1.name(),
-            id1.inherit_type())
-            == std::tie(id2.group_name(), id2.instance_id(), id2.name(),
-                    id2.inherit_type());
+    return as_tuple() < id2.as_tuple();
 }
 
 // Unfortunately, metrics_impl can not be shared because it
 // need to be available before the first users (reactor) will call it
 
 shared_ptr<impl>  get_local_impl() {
-    static thread_local auto the_impl = make_shared<impl>();
+    static thread_local auto the_impl = ::make_shared<impl>();
     return the_impl;
+}
+void impl::remove_registration(const metric_id& id) {
+    auto i = get_value_map().find(id.full_name());
+    if (i != get_value_map().end()) {
+        auto j = i->second.find(id.labels());
+        if (j != i->second.end()) {
+            j->second = nullptr;
+            i->second.erase(j);
+        }
+        if (i->second.empty()) {
+            get_value_map().erase(i);
+        }
+        dirty();
+    }
 }
 
 void unregister_metric(const metric_id & id) {
-    value_map& map = get_local_impl()->get_value_map();
-    auto i = map.find(id);
-    if (i != map.end()) {
-        i->second = nullptr;
-    }
+    get_local_impl()->remove_registration(id);
 }
 
 const value_map& get_value_map() {
     return get_local_impl()->get_value_map();
 }
 
-values_copy get_values() {
-    values_copy res;
-
-    for (auto i : get_local_impl()->get_value_map()) {
-        if (i.second.get() && i.second->is_enabled()) {
-            res[i.first] = (*(i.second))();
+foreign_ptr<values_reference> get_values() {
+    shared_ptr<values_copy> res_ref = ::make_shared<values_copy>();
+    auto& res = *(res_ref.get());
+    auto& mv = res.values;
+    res.metadata = get_local_impl()->metadata();
+    auto & functions = get_local_impl()->functions();
+    mv.reserve(functions.size());
+    for (auto&& i : functions) {
+        value_vector values;
+        values.reserve(i.size());
+        for (auto&& v : i) {
+            values.emplace_back(v());
         }
+        mv.emplace_back(std::move(values));
     }
-    return std::move(res);
+    return res_ref;
 }
 
 
@@ -158,12 +246,99 @@ instance_id_type shard() {
     return to_sstring(engine().cpu_id());
 }
 
-void impl::add_registration(const metric_id& id, shared_ptr<registered_metric> rm) {
-    _value_map[id] = rm;
+void impl::update_metrics_if_needed() {
+    if (_dirty) {
+        // Forcing the metadata to an empty initialization
+        // Will prevent using corrupted data if an exception is thrown
+        _metadata = ::make_shared<metric_metadata>();
+
+        auto mt_ref = ::make_shared<metric_metadata>();
+        auto &mt = *(mt_ref.get());
+        mt.reserve(_value_map.size());
+        _current_metrics.resize(_value_map.size());
+        size_t i = 0;
+        for (auto&& mf : _value_map) {
+            metric_metadata_vector metrics;
+            _current_metrics[i].clear();
+            for (auto&& m : mf.second) {
+                if (m.second && m.second->is_enabled()) {
+                    metrics.emplace_back(m.second->info());
+                    _current_metrics[i].emplace_back(m.second->get_function());
+                }
+            }
+            if (!metrics.empty()) {
+                // If nothing was added, no need to add the metric_family
+                // and no need to progress
+                mt.emplace_back(metric_family_metadata{mf.second.info(), std::move(metrics)});
+                i++;
+            }
+        }
+        // Maybe we didn't use all the original size
+        _current_metrics.resize(i);
+        _metadata = mt_ref;
+        _dirty = false;
+    }
 }
 
+shared_ptr<metric_metadata> impl::metadata() {
+    update_metrics_if_needed();
+    return _metadata;
+}
+
+std::vector<std::vector<metric_function>>& impl::functions() {
+    update_metrics_if_needed();
+    return _current_metrics;
+}
+
+void impl::add_registration(const metric_id& id, data_type type, metric_function f, const description& d, bool enabled) {
+    auto rm = ::make_shared<registered_metric>(id, f, enabled);
+    sstring name = id.full_name();
+    if (_value_map.find(name) != _value_map.end()) {
+        auto& metric = _value_map[name];
+        if (metric.find(id.labels()) != metric.end()) {
+            throw std::runtime_error("registering metrics twice for metrics: " + name);
+        }
+        if (metric.info().type != type) {
+            throw std::runtime_error("registering metrics " + name + " registered with different type.");
+        }
+        metric[id.labels()] = rm;
+    } else {
+        _value_map[name].info().type = type;
+        _value_map[name].info().d = d;
+        _value_map[name].info().name = id.full_name();
+        _value_map[name][id.labels()] = rm;
+    }
+    dirty();
+}
+
+}
 
 const bool metric_disabled = false;
+
+
+histogram& histogram::operator+=(const histogram& c) {
+    for (size_t i = 0; i < c.buckets.size(); i++) {
+        if (buckets.size() <= i) {
+            buckets.push_back(c.buckets[i]);
+        } else {
+            if (buckets[i].upper_bound != c.buckets[i].upper_bound) {
+                throw std::out_of_range("Trying to add histogram with different bucket limits");
+            }
+            buckets[i].count += c.buckets[i].count;
+        }
+    }
+    return *this;
+}
+
+histogram histogram::operator+(const histogram& c) const {
+    histogram res = *this;
+    res += c;
+    return res;
+}
+
+histogram histogram::operator+(histogram&& c) const {
+    c += *this;
+    return std::move(c);
 }
 
 }

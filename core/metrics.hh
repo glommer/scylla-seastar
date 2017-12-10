@@ -25,6 +25,10 @@
 #include "sstring.hh"
 #include "core/shared_ptr.hh"
 #include "core/metrics_registration.hh"
+#include <boost/lexical_cast.hpp>
+#include <map>
+#include "core/metrics_types.hh"
+#include <boost/variant.hpp>
 
 /*! \file metrics.hh
  *  \brief header for metrics creation.
@@ -121,6 +125,115 @@ private:
 };
 
 /*!
+ * \brief Label a metrics
+ *
+ * Label are useful for adding information about a metric that
+ * later you would need to aggregate by.
+ * For example, if you have multiple queues on a shard.
+ * Adding the queue id as a Label will allow you to use the same name
+ * of the metrics with multiple id instances.
+ *
+ * label_instance holds an instance of label consist of a key and value.
+ *
+ * Typically you will not generate a label_instance yourself, but use a label
+ * object for that.
+ * @see label for more information
+ *
+ *
+ */
+class label_instance {
+    sstring _key;
+    sstring _value;
+public:
+    /*!
+     * \brief create a label_instance
+     * label instance consists of key and value.
+     * The key is an sstring.
+     * T - the value type can be any type that can be lexical_cast to string
+     * (ie. if it support the redirection operator for stringstream).
+     *
+     * All primitive types are supported so all the following examples are valid:
+     * label_instance a("smp_queue", 1)
+     * label_instance a("my_key", "my_value")
+     * label_instance a("internal_id", -1)
+     */
+    template<typename T>
+    label_instance(const sstring& key, T v) : _key(key), _value(boost::lexical_cast<std::string>(v)){}
+
+    /*!
+     * \brief returns the label key
+     */
+    const sstring key() const {
+        return _key;
+    }
+
+    /*!
+     * \brief returns the label value
+     */
+    const sstring value() const {
+        return _value;
+    }
+    bool operator<(const label_instance&) const;
+    bool operator==(const label_instance&) const;
+    bool operator!=(const label_instance&) const;
+};
+
+
+/*!
+ * \brief Class that creates label instances
+ *
+ * A factory class to create label instance
+ * Typically, the same Label name is used in multiple places.
+ * label is a label factory, you create it once, and use it to create the label_instance.
+ *
+ * In the example we would like to label the smp_queue with with the queue owner
+ *
+ * seastar::metrics::label smp_owner("smp_owner");
+ *
+ * now, when creating a new smp metric we can add a label to it:
+ *
+ * sm::make_queue_length("send_batch_queue_length", _last_snt_batch, {smp_owner(cpuid)})
+ *
+ * where cpuid in this case is unsiged.
+ */
+class label {
+    sstring key;
+public:
+    using instance = label_instance;
+    /*!
+     * \brief creating a label
+     * key is the label name, it will be the key for all label_instance
+     * that will be created from this label.
+     */
+    explicit label(const sstring& key) : key(key) {
+    }
+
+    /*!
+     * \brief creating a label instance
+     *
+     * Use the function operator to create a new label instance.
+     * T - the value type can be any type that can be lexical_cast to string
+     * (ie. if it support the redirection operator for stringstream).
+     *
+     * All primitive types are supported so if lab is a label, all the following examples are valid:
+     * lab(1)
+     * lab("my_value")
+     * lab(-1)
+     */
+    template<typename T>
+    instance operator()(T value) const {
+        return label_instance(key, std::forward<T>(value));
+    }
+
+    /*!
+     * \brief returns the label name
+     */
+    const sstring& name() const {
+        return key;
+    }
+};
+
+/*!
  * \namesapce impl
  * \brief holds the implementation parts of the metrics layer, do not use directly.
  *
@@ -135,6 +248,7 @@ enum class data_type : uint8_t {
     GAUGE, // double
     DERIVE, // signed int 64
     ABSOLUTE, // unsigned int 64
+    HISTOGRAM,
 };
 
 /*!
@@ -143,47 +257,37 @@ enum class data_type : uint8_t {
  * Do not use directly @see metrics_creation
  */
 struct metric_value {
-    union {
-        double _d;
-        uint64_t _ui;
-        int64_t _i;
-    } u;
+    boost::variant<double, histogram> u;
     data_type _type;
-
     data_type type() const {
         return _type;
     }
 
     double d() const {
-        return u._d;
+        return boost::get<double>(u);
     }
 
     uint64_t ui() const {
-        return u._ui;
+        return boost::get<double>(u);
     }
 
     int64_t i() const {
-        return u._i;
+        return boost::get<double>(u);
     }
 
     metric_value()
             : _type(data_type::GAUGE) {
     }
 
-    template<typename T>
-    metric_value(T i, data_type t)
-            : _type(t) {
-        switch (_type) {
-        case data_type::DERIVE:
-            u._i = i;
-            break;
-        case data_type::GAUGE:
-            u._d = i;
-            break;
-        default:
-            u._ui = i;
-            break;
-        }
+    metric_value(histogram&& h, data_type t = data_type::HISTOGRAM) :
+        u(std::move(h)), _type(t) {
+    }
+    metric_value(const histogram& h, data_type t = data_type::HISTOGRAM) :
+        u(h), _type(t) {
+    }
+
+    metric_value(double d, data_type t)
+            : u(d), _type(t) {
     }
 
     metric_value& operator=(const metric_value& c) = default;
@@ -194,6 +298,9 @@ struct metric_value {
     }
 
     metric_value operator+(const metric_value& c);
+    const histogram& get_histogram() const {
+        return boost::get<histogram>(u);
+    }
 };
 
 using metric_function = std::function<metric_value()>;
@@ -205,11 +312,19 @@ struct metric_type {
 
 struct metric_definition_impl {
     metric_name_type name;
-    instance_id_type id;
     metric_type type;
     metric_function f;
     description d;
     bool enabled = true;
+    std::map<sstring, sstring> labels;
+    metric_definition_impl& operator ()(bool enabled);
+    metric_definition_impl& operator ()(const label_instance& label);
+    metric_definition_impl(
+        metric_name_type name,
+        metric_type type,
+        metric_function f,
+        description d,
+        std::vector<label_instance> labels);
 };
 
 class metric_groups_def {
@@ -224,9 +339,6 @@ public:
 };
 
 instance_id_type shard();
-
-extern const bool metric_disabled;
-
 
 template<typename T, typename En = std::true_type>
 struct is_callable;
@@ -253,6 +365,12 @@ metric_function make_function(T& val, data_type dt) {
     };
 }
 }
+
+extern const bool metric_disabled;
+
+extern label shard_label;
+extern label type_label;
+
 /*
  * The metrics definition are defined to be compatible with collectd metrics defintion.
  * Typically you should used gauge or derived.
@@ -266,10 +384,21 @@ metric_function make_function(T& val, data_type dt) {
  */
 template<typename T>
 impl::metric_definition_impl make_gauge(metric_name_type name,
-        T&& val, description d=description(), bool enabled=true,
-        instance_id_type instance = impl::shard(), metric_type_def iht = "gauge") {
-    return {name, instance, {impl::data_type::GAUGE, iht}, make_function(std::forward<T>(val), impl::data_type::GAUGE), d, enabled};
+        T&& val, description d=description(), std::vector<label_instance> labels = {}) {
+    return {name, {impl::data_type::GAUGE, "gauge"}, make_function(std::forward<T>(val), impl::data_type::GAUGE), d, labels};
 }
+
+/*!
+ * \brief Gauge are a general purpose metric.
+ *
+ * They can support floating point and can increase or decrease
+ */
+template<typename T>
+impl::metric_definition_impl make_gauge(metric_name_type name,
+        description d, T&& val) {
+    return {name, {impl::data_type::GAUGE, "gauge"}, make_function(std::forward<T>(val), impl::data_type::GAUGE), d, {}};
+}
+
 
 /*!
  * \brief Derive are used when a rate is more interesting than the value.
@@ -281,10 +410,25 @@ impl::metric_definition_impl make_gauge(metric_name_type name,
  */
 template<typename T>
 impl::metric_definition_impl make_derive(metric_name_type name,
-        T&& val, description d=description(), bool enabled=true,
-        instance_id_type instance = impl::shard(), metric_type_def iht = "derive") {
-    return {name, instance, {impl::data_type::DERIVE, iht}, make_function(std::forward<T>(val), impl::data_type::DERIVE), d, enabled};
+        T&& val, description d=description(), std::vector<label_instance> labels = {}) {
+    return {name, {impl::data_type::DERIVE, "derive"}, make_function(std::forward<T>(val), impl::data_type::DERIVE), d, labels};
 }
+
+
+/*!
+ * \brief Derive are used when a rate is more interesting than the value.
+ *
+ * Derive is an integer value that can increase or decrease, typically it is used when looking at the
+ * derivation of the value.
+ *
+ * It is OK to use it when counting things and if no wrap-around is expected (it shouldn't) it's prefer over counter metric.
+ */
+template<typename T>
+impl::metric_definition_impl make_derive(metric_name_type name, description d,
+        T&& val) {
+    return {name, {impl::data_type::DERIVE, "derive"}, make_function(std::forward<T>(val), impl::data_type::DERIVE), d, {}};
+}
+
 
 /*!
  * \brief create a counter metric
@@ -295,9 +439,8 @@ impl::metric_definition_impl make_derive(metric_name_type name,
  */
 template<typename T>
 impl::metric_definition_impl make_counter(metric_name_type name,
-        T&& val, description d=description(), bool enabled=true,
-        instance_id_type instance = impl::shard(), metric_type_def iht = "counter") {
-    return {name, instance, {impl::data_type::COUNTER, iht}, make_function(std::forward<T>(val), impl::data_type::COUNTER), d, enabled};
+        T&& val, description d=description(), std::vector<label_instance> labels = {}) {
+    return {name, {impl::data_type::COUNTER, "counter"}, make_function(std::forward<T>(val), impl::data_type::COUNTER), d, labels};
 }
 
 /*!
@@ -308,10 +451,34 @@ impl::metric_definition_impl make_counter(metric_name_type name,
  */
 template<typename T>
 impl::metric_definition_impl make_absolute(metric_name_type name,
-        T&& val, description d=description(), bool enabled=true,
-        instance_id_type instance = impl::shard(), metric_type_def iht = "absolute") {
-    return {name, instance, {impl::data_type::ABSOLUTE, iht}, make_function(std::forward<T>(val), impl::data_type::ABSOLUTE), d, enabled};
+        T&& val, description d=description(), std::vector<label_instance> labels = {}) {
+    return {name, {impl::data_type::ABSOLUTE, "absolute"}, make_function(std::forward<T>(val), impl::data_type::ABSOLUTE), d, labels};
 }
+
+/*!
+ * \brief create a histogram metric.
+ *
+ * Histograms are a list o buckets with upper values and counter for the number
+ * of entries in each bucket.
+ */
+template<typename T>
+impl::metric_definition_impl make_histogram(metric_name_type name,
+        T&& val, description d=description(), std::vector<label_instance> labels = {}) {
+    return  {name, {impl::data_type::HISTOGRAM, "histogram"}, make_function(std::forward<T>(val), impl::data_type::HISTOGRAM), d, labels};
+}
+
+/*!
+ * \brief create a histogram metric.
+ *
+ * Histograms are a list o buckets with upper values and counter for the number
+ * of entries in each bucket.
+ */
+template<typename T>
+impl::metric_definition_impl make_histogram(metric_name_type name,
+        description d, T&& val) {
+    return  {name, {impl::data_type::HISTOGRAM, "histogram"}, make_function(std::forward<T>(val), impl::data_type::HISTOGRAM), d, {}};
+}
+
 
 /*!
  * \brief create a total_bytes metric.
@@ -322,9 +489,9 @@ impl::metric_definition_impl make_absolute(metric_name_type name,
 
 template<typename T>
 impl::metric_definition_impl make_total_bytes(metric_name_type name,
-        T&& val, description d=description(), bool enabled=true,
+        T&& val, description d=description(), std::vector<label_instance> labels = {},
         instance_id_type instance = impl::shard()) {
-    return make_derive(name, std::forward<T>(val), d, enabled, instance, "total_bytes");
+    return make_derive(name, std::forward<T>(val), d, labels)(type_label("total_bytes"));
 }
 
 /*!
@@ -336,9 +503,9 @@ impl::metric_definition_impl make_total_bytes(metric_name_type name,
 
 template<typename T>
 impl::metric_definition_impl make_current_bytes(metric_name_type name,
-        T&& val, description d=description(), bool enabled=true,
+        T&& val, description d=description(), std::vector<label_instance> labels = {},
         instance_id_type instance = impl::shard()) {
-    return make_derive(name, std::forward<T>(val), d, enabled, instance, "bytes");
+    return make_derive(name, std::forward<T>(val), d, labels)(type_label("bytes"));
 }
 
 
@@ -350,9 +517,9 @@ impl::metric_definition_impl make_current_bytes(metric_name_type name,
 
 template<typename T>
 impl::metric_definition_impl make_queue_length(metric_name_type name,
-        T&& val, description d=description(), bool enabled=true,
+        T&& val, description d=description(), std::vector<label_instance> labels = {},
         instance_id_type instance = impl::shard()) {
-    return make_gauge(name, std::forward<T>(val), d, enabled, instance, "queue_length");
+    return make_gauge(name, std::forward<T>(val), d, labels)(type_label("queue_length"));
 }
 
 
@@ -364,9 +531,9 @@ impl::metric_definition_impl make_queue_length(metric_name_type name,
 
 template<typename T>
 impl::metric_definition_impl make_total_operations(metric_name_type name,
-        T&& val, description d=description(), bool enabled=true,
+        T&& val, description d=description(), std::vector<label_instance> labels = {},
         instance_id_type instance = impl::shard()) {
-    return make_derive(name, std::forward<T>(val), d, enabled, instance, "total_operations");
+    return make_derive(name, std::forward<T>(val), d, labels)(type_label("total_operations"));
 }
 
 /*! @} */
