@@ -35,6 +35,7 @@
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <signal.h>
 #include <system_error>
 #include <boost/optional.hpp>
