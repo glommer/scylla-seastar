@@ -315,6 +315,7 @@ core = [
     'core/app-template.cc',
     'core/thread.cc',
     'core/dpdk_rte.cc',
+    'core/linux-aio.cc',
     'util/conversions.cc',
     'util/log.cc',
     'net/packet.cc',
@@ -362,8 +363,7 @@ def maybe_static(flag, libs):
 
 defines = ['FMT_HEADER_ONLY']
 # Include -lgcc_s before -lunwind to work around for https://savannah.nongnu.org/bugs/?48486. See https://github.com/scylladb/scylla/issues/1725.
-libs = ' '.join(['-laio',
-                 maybe_static(args.staticboost,
+libs = ' '.join([maybe_static(args.staticboost,
                               '-lboost_program_options -lboost_system -lboost_filesystem'),
                  '-lstdc++ -lm',
                  maybe_static(args.staticboost, '-lboost_thread'),
@@ -451,7 +451,7 @@ deps = {
     'tests/fair_queue_test': ['tests/fair_queue_test.cc'] + core,
     'apps/seawreck/seawreck': ['apps/seawreck/seawreck.cc', 'http/http_response_parser.rl'] + core + libnet,
     'apps/fair_queue_tester/fair_queue_tester': ['apps/fair_queue_tester/fair_queue_tester.cc'] + core,
-    'apps/iotune/iotune': ['apps/iotune/iotune.cc', 'apps/iotune/fsqual.cc'] + ['core/resource.cc'],
+    'apps/iotune/iotune': ['apps/iotune/iotune.cc', 'apps/iotune/fsqual.cc', 'core/linux-aio.cc'] + ['core/resource.cc'],
     'tests/blkdiscard_test': ['tests/blkdiscard_test.cc'] + core,
     'tests/sstring_test': ['tests/sstring_test.cc'] + core,
     'tests/unwind_test': ['tests/unwind_test.cc'] + core,

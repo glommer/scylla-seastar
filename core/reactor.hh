@@ -27,7 +27,6 @@
 #include "aligned_buffer.hh"
 #include <memory>
 #include <type_traits>
-#include <libaio.h>
 #include <sys/epoll.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -46,12 +45,15 @@
 #include <chrono>
 #include <ratio>
 #include <atomic>
+#include <stack>
 #include <experimental/optional>
 #include <boost/lockfree/spsc_queue.hpp>
 #include <boost/optional.hpp>
 #include <boost/program_options.hpp>
 #include <boost/thread/barrier.hpp>
+#include <boost/container/static_vector.hpp>
 #include <set>
+#include "linux-aio.hh"
 #include "util/eclipse.hh"
 #include "future.hh"
 #include "posix.hh"
@@ -694,8 +696,11 @@ private:
     seastar::timer_set<timer<lowres_clock>, &timer<lowres_clock>::_link>::timer_list_t _expired_lowres_timers;
     seastar::timer_set<timer<manual_clock>, &timer<manual_clock>::_link> _manual_timers;
     seastar::timer_set<timer<manual_clock>, &timer<manual_clock>::_link>::timer_list_t _expired_manual_timers;
-    io_context_t _io_context;
-    std::vector<struct ::iocb> _pending_aio;
+    ::aio_context_t _io_context;
+    alignas(64 /* cache_line_size */) std::array<::iocb, max_aio> _iocb_pool;
+    std::stack<::iocb*, boost::container::static_vector<::iocb*, max_aio>> _free_iocbs;
+    boost::container::static_vector<::iocb*, max_aio> _pending_aio;
+    boost::container::static_vector<::iocb*, max_aio> _pending_aio_retry;
     semaphore _io_context_available;
     uint64_t _aio_reads = 0;
     uint64_t _aio_read_bytes = 0;
@@ -745,6 +750,7 @@ private:
     static std::chrono::nanoseconds calculate_poll_time();
     static void block_notifier(int);
     void wakeup();
+    size_t handle_aio_error(::iocb* iocb, int ec);
     bool flush_pending_aio();
     bool flush_tcp_batches();
     bool do_expire_lowres_timers();
