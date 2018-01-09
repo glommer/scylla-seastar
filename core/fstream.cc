@@ -366,6 +366,9 @@ public:
             // This should only happen when the user calls output_stream::flush().
             auto tmp = allocate_buffer(align_up(buf.size(), _file.disk_write_dma_alignment()));
             ::memcpy(tmp.get_write(), buf.get(), buf.size());
+            // Avoid false positives from file integrity detector on tail writes that are
+            // just a few bytes and happen to be all zeros
+            std::fill_n(tmp.get_write() + buf.size(), tmp.size() - buf.size(), 1);
             buf = std::move(tmp);
             p = buf.get();
             buf_size = buf.size();
