@@ -24,6 +24,8 @@
 #include <sys/syscall.h>
 #include <sys/vfs.h>
 #include <sys/statfs.h>
+#include <sys/time.h>
+#include <sys/resource.h>
 #include "task.hh"
 #include "reactor.hh"
 #include "memory.hh"
@@ -39,6 +41,7 @@
 #include "thread.hh"
 #include "systemwide_memory_barrier.hh"
 #include "report_exception.hh"
+#include "core/stall_sampler.hh"
 #include "util/log.hh"
 #include "file-impl.hh"
 #include <cassert>
@@ -97,7 +100,7 @@ using namespace std::chrono_literals;
 using namespace net;
 using namespace seastar;
 
-using namespace internal;
+using namespace seastar::internal;
 
 seastar::logger seastar_logger("seastar");
 
@@ -1146,8 +1149,10 @@ posix_file_impl::read_dma(uint64_t pos, std::vector<iovec> iov, const io_priorit
 }
 
 append_challenged_posix_file_impl::append_challenged_posix_file_impl(int fd, file_open_options options,
-        unsigned max_size_changing_ops)
-        : posix_file_impl(fd, options), _max_size_changing_ops(max_size_changing_ops) {
+        unsigned max_size_changing_ops, bool fsync_is_exclusive)
+        : posix_file_impl(fd, options)
+        , _max_size_changing_ops(max_size_changing_ops)
+        , _fsync_is_exclusive(fsync_is_exclusive) {
     auto r = ::lseek(fd, 0, SEEK_END);
     throw_system_error_on(r == -1);
     _committed_size = _logical_size = r;
@@ -1169,7 +1174,7 @@ bool
 append_challenged_posix_file_impl::must_run_alone(const op& candidate) const noexcept {
     // checks if candidate is a non-write, size-changing operation.
     return (candidate.type == opcode::truncate)
-            || (_sloppy_size && candidate.type == opcode::flush);
+            || (candidate.type == opcode::flush && (_fsync_is_exclusive || _sloppy_size));
 }
 
 bool
@@ -1385,7 +1390,7 @@ append_challenged_posix_file_impl::write_dma(uint64_t pos, std::vector<iovec> io
 
 future<>
 append_challenged_posix_file_impl::flush() {
-    if (!_sloppy_size || _logical_size == _committed_size) {
+    if ((!_sloppy_size || _logical_size == _committed_size) && !_fsync_is_exclusive) {
         // FIXME: determine if flush can block concurrent reads or writes
         return posix_file_impl::flush();
     } else {
@@ -1528,6 +1533,7 @@ make_file_impl(int fd, file_open_options options) {
         struct append_support {
             bool append_challenged;
             unsigned append_concurrency;
+            bool fsync_is_exclusive;
         };
         static thread_local std::unordered_map<decltype(st.st_dev), append_support> s_fstype;
         if (!s_fstype.count(st.st_dev)) {
@@ -1540,14 +1546,22 @@ make_file_impl(int fd, file_open_options options) {
                 as.append_challenged = true;
                 static auto xc = xfs_concurrency_from_kernel_version();
                 as.append_concurrency = xc;
+                as.fsync_is_exclusive = true;
                 break;
             case 0x6969: /* NFS */
                 as.append_challenged = false;
                 as.append_concurrency = 0;
+                as.fsync_is_exclusive = false;
+                break;
+            case 0xEF53: /* EXT4 */
+                as.append_challenged = true;
+                as.append_concurrency = 0;
+                as.fsync_is_exclusive = false;
                 break;
             default:
                 as.append_challenged = true;
                 as.append_concurrency = 0;
+                as.fsync_is_exclusive = true;
             }
             s_fstype[st.st_dev] = as;
         }
@@ -1555,7 +1569,7 @@ make_file_impl(int fd, file_open_options options) {
         if (!as.append_challenged) {
             return make_shared<posix_file_impl>(fd, options);
         }
-        return make_shared<append_challenged_posix_file_impl>(fd, options, as.append_concurrency);
+        return make_shared<append_challenged_posix_file_impl>(fd, options, as.append_concurrency, as.fsync_is_exclusive);
     }
 }
 
@@ -4200,4 +4214,86 @@ steady_clock_type::duration reactor::total_idle_time() {
 
 steady_clock_type::duration reactor::total_busy_time() {
     return steady_clock_type::now() - _start_time - _total_idle;
+}
+
+namespace internal {
+
+inline
+std::chrono::steady_clock::duration
+timeval_to_duration(::timeval tv) {
+    return std::chrono::seconds(tv.tv_sec) + std::chrono::microseconds(tv.tv_usec);
+}
+
+class reactor_stall_sampler : public reactor::pollfn {
+    std::chrono::steady_clock::time_point _run_start;
+    ::rusage _run_start_rusage;
+    uint64_t _kernel_stalls = 0;
+    std::chrono::steady_clock::duration _nonsleep_cpu_time = {};
+    std::chrono::steady_clock::duration _nonsleep_wall_time = {};
+private:
+    static ::rusage get_rusage() {
+        struct ::rusage ru;
+        ::getrusage(RUSAGE_THREAD, &ru);
+        return ru;
+    }
+    static std::chrono::steady_clock::duration cpu_time(const ::rusage& ru) {
+        return timeval_to_duration(ru.ru_stime) + timeval_to_duration(ru.ru_utime);
+    }
+    void mark_run_start() {
+        _run_start = std::chrono::steady_clock::now();
+        _run_start_rusage = get_rusage();
+    }
+    void mark_run_end() {
+        auto start_nvcsw = _run_start_rusage.ru_nvcsw;
+        auto start_cpu_time = cpu_time(_run_start_rusage);
+        auto start_time = _run_start;
+        _run_start = std::chrono::steady_clock::now();
+        _run_start_rusage = get_rusage();
+        _kernel_stalls += _run_start_rusage.ru_nvcsw - start_nvcsw;
+        _nonsleep_cpu_time += cpu_time(_run_start_rusage) - start_cpu_time;
+        _nonsleep_wall_time += _run_start - start_time;
+    }
+public:
+    reactor_stall_sampler() { mark_run_start(); }
+    virtual bool poll() override { return false; }
+    virtual bool pure_poll() override { return false; }
+    virtual bool try_enter_interrupt_mode() override {
+        // try_enter_interrupt_mode marks the end of a reactor run that should be context-switch free
+        mark_run_end();
+        return true;
+    }
+    virtual void exit_interrupt_mode() override {
+        // start a reactor run that should be context switch free
+        mark_run_start();
+    }
+    stall_report report() const {
+        stall_report r;
+        // mark_run_end() with an immediate mark_run_start() is logically a no-op,
+        // but each one of them has an effect, so they can't be marked const
+        const_cast<reactor_stall_sampler*>(this)->mark_run_end();
+        r.kernel_stalls = _kernel_stalls;
+        r.run_wall_time = _nonsleep_wall_time;
+        r.stall_time = _nonsleep_wall_time - _nonsleep_cpu_time;
+        const_cast<reactor_stall_sampler*>(this)->mark_run_start();
+        return r;
+    }
+};
+
+future<stall_report>
+report_reactor_stalls(noncopyable_function<future<> ()> uut) {
+    auto reporter = std::make_unique<reactor_stall_sampler>();
+    auto p_reporter = reporter.get();
+    auto poller = reactor::poller(std::move(reporter));
+    return uut().then([poller = std::move(poller), p_reporter] () mutable {
+        return p_reporter->report();
+    });
+}
+
+std::ostream& operator<<(std::ostream& os, const stall_report& sr) {
+    auto to_ms = [] (std::chrono::steady_clock::duration d) -> float {
+        return std::chrono::duration<float>(d) / 1ms;
+    };
+    return os << format("{} stalls, {} ms stall time, {} ms run time", sr.kernel_stalls, to_ms(sr.stall_time), to_ms(sr.run_wall_time));
+}
+
 }

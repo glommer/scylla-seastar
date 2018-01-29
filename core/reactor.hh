@@ -574,6 +574,12 @@ public:
     friend class reactor;
 };
 
+namespace internal {
+
+class reactor_stall_sampler;
+
+}
+
 class reactor {
 private:
     struct pollfn {
@@ -615,6 +621,7 @@ private:
     friend class epoll_pollfn;
     friend class syscall_pollfn;
     friend class file_data_source_impl; // for fstream statistics
+    friend class internal::reactor_stall_sampler;
 public:
     class poller {
         std::unique_ptr<pollfn> _pollfn;
