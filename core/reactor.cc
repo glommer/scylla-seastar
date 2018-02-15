@@ -1577,10 +1577,61 @@ file::file(int fd, file_open_options options)
         : _file_impl(make_file_impl(fd, options)) {
 }
 
+int xfs_open_by_handle(int fsfd, int open_flags, xfs_fsop_handlereq_t& handle) {
+    auto try_handle = ::ioctl(fsfd, XFS_IOC_PATH_TO_HANDLE, &handle);
+    if (try_handle < 0) {
+        return try_handle;
+    }
+    handle.ihandle = handle.ohandle;
+    handle.ihandlen = *handle.ohandlen;
+    handle.ohandle = nullptr;
+    handle.ohandlen = nullptr;
+    handle.oflags = open_flags;
+
+    auto ohandle = ::ioctl(fsfd, XFS_IOC_OPEN_BY_HANDLE, &handle);
+    if (ohandle < 0) {
+        perror(sprint("open_by_handle failed (%s)", handle.path).c_str());
+    }
+    return ohandle;
+}
+
+int try_xfs_open_by_handle(sstring name, int open_flags, int mode) {
+    xfs_fsop_handlereq_t handle;
+    char hbuffer[1024];
+    uint32_t hlen;
+    handle.ohandle = hbuffer;
+    handle.ohandlen = &hlen;
+    handle.path = name.begin();
+
+    auto dir = boost::filesystem::path(name).parent_path();
+
+    int fsfd = open(dir.c_str(), O_DIRECTORY);
+    if (fsfd >=  0) {
+        auto fd = xfs_open_by_handle(fsfd, open_flags, handle);
+        if (fd >= 0) {
+            return fd;
+        }
+        if ((errno == ENOENT) && (open_flags & O_CREAT)) {
+            auto creat = ::open(name.c_str(), open_flags, mode);
+            if (creat >= 0) {
+                close(creat);
+                fd = xfs_open_by_handle(fsfd, open_flags, handle);
+                if (fd >= 0) {
+                    return fd;
+                }
+            }
+        }
+        perror(sprint("failed to get xfs fshandle for %s", name).c_str());
+    }
+    // failed, opens normally.
+    return ::open(name.c_str(), open_flags, mode);
+}
+
+
 future<file>
 reactor::open_file_dma(sstring name, open_flags flags, file_open_options options) {
     static constexpr mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH; // 0644
-    return _thread_pool.submit<syscall_result<int>>([name, flags, options, strict_o_direct = _strict_o_direct] {
+    return _thread_pool.submit<syscall_result<int>>([name, flags, options, strict_o_direct = _strict_o_direct] () mutable {
         // We want O_DIRECT, except in two cases:
         //   - tmpfs (which doesn't support it, but works fine anyway)
         //   - strict_o_direct == false (where we forgive it being not supported)
@@ -1596,7 +1647,8 @@ reactor::open_file_dma(sstring name, open_flags flags, file_open_options options
             return buf.f_type == 0x01021994; // TMPFS_MAGIC
         };
         auto open_flags = O_CLOEXEC | static_cast<int>(flags);
-        int fd = ::open(name.c_str(), open_flags, mode);
+
+        int fd = try_xfs_open_by_handle(name, open_flags, mode);
         if (fd == -1) {
             return wrap_syscall<int>(fd);
         }
@@ -2758,6 +2810,10 @@ int reactor::run() {
     poller batch_flush_poller(std::make_unique<batch_flush_pollfn>(*this));
 
     start_aio_eventfd_loop();
+
+    if (_id == 0) {
+        seastar_logger.warn("THIS IS A TEST VERSION THAT DOESN'T UPDATE FILE TIMESTAMPS. NOT FOR PRODUCTION USAGE. This version fixes the PATH_TO_FSHANDLE issue with ENOENT");
+    }
 
     if (_id == 0) {
        if (_handle_sigint) {
